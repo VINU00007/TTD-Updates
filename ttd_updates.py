@@ -1,28 +1,14 @@
 import os
-import asyncio
-import time
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, time as dt_time
 
-from playwright.async_api import async_playwright
-
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-)
-
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.request import HTTPXRequest
 
 
 print("🛕 TTD BOT STARTING...")
-
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -30,43 +16,37 @@ CHAT_ID = os.getenv("CHAT_ID")
 URL = "https://ttdevasthanams.ap.gov.in/home/dashboard"
 
 
-# ---------------------------
+# -------------------------
 # SCRAPE TTD WEBSITE
-# ---------------------------
+# -------------------------
 
-async def fetch_updates():
+def fetch_updates():
+
+    response = requests.get(URL, timeout=20)
+
+    soup = BeautifulSoup(response.text, "html.parser")
 
     updates = []
 
-    async with async_playwright() as p:
+    items = soup.find_all("li")
 
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+    for item in items:
 
-        await page.goto(URL)
-        await page.wait_for_timeout(5000)
+        text = item.get_text(strip=True)
 
-        elements = await page.locator("li").all()
+        if "New" in text:
 
-        for el in elements:
+            clean = text.replace("New", "").strip()
 
-            text = await el.inner_text()
-
-            if "New" in text:
-
-                clean = text.replace("New", "").strip()
-
-                if len(clean) > 5:
-                    updates.append(clean)
-
-        await browser.close()
+            if len(clean) > 5:
+                updates.append(clean)
 
     return updates
 
 
-# ---------------------------
+# -------------------------
 # FORMAT MESSAGE
-# ---------------------------
+# -------------------------
 
 def format_message(updates):
 
@@ -93,70 +73,58 @@ No new notifications today.
     return message
 
 
-# ---------------------------
+# -------------------------
 # /start COMMAND
-# ---------------------------
+# -------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    keyboard = [
-        [InlineKeyboardButton("🔍 Check TTD Updates", callback_data="check")]
-    ]
-
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    keyboard = [[InlineKeyboardButton("🔍 Check TTD Updates", callback_data="check")]]
 
     await update.message.reply_text(
         "🛕 TTD Update Bot\n\nClick the button below to check latest updates.",
-        reply_markup=reply_markup
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# ---------------------------
+# -------------------------
 # BUTTON HANDLER
-# ---------------------------
+# -------------------------
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     query = update.callback_query
     await query.answer()
 
-    updates = await fetch_updates()
+    updates = fetch_updates()
 
     message = format_message(updates)
 
     await query.edit_message_text(message)
 
 
-# ---------------------------
+# -------------------------
 # DAILY SUMMARY
-# ---------------------------
+# -------------------------
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
-    updates = await fetch_updates()
+    updates = fetch_updates()
 
     message = format_message(updates)
 
-    await context.bot.send_message(
-        chat_id=CHAT_ID,
-        text=message
-    )
+    await context.bot.send_message(chat_id=CHAT_ID, text=message)
 
 
-# ---------------------------
-# MAIN FUNCTION
-# ---------------------------
+# -------------------------
+# MAIN
+# -------------------------
 
 def main():
 
     request = HTTPXRequest(connect_timeout=30, read_timeout=30)
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .build()
-    )
+    app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
@@ -170,19 +138,8 @@ def main():
 
     print("🚀 TTD BOT RUNNING...")
 
-    while True:
+    app.run_polling()
 
-        try:
-
-            app.run_polling()
-
-        except Exception as e:
-
-            print("Bot crashed, restarting:", e)
-            time.sleep(10)
-
-
-# ---------------------------
 
 if __name__ == "__main__":
     main()
