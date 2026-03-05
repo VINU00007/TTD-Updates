@@ -1,6 +1,6 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "deploy": {
-    "startCommand": "playwright install chromium && python ttd_updates.py"
+    "startCommand": "python ttd_updates.py"
   }
 }
