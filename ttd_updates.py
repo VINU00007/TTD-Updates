@@ -4,11 +4,18 @@ from bs4 import BeautifulSoup
 from datetime import datetime, time as dt_time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+
 from telegram.request import HTTPXRequest
 
 
 print("🛕 TTD BOT STARTING...")
+
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -17,35 +24,35 @@ URL = "https://ttdevasthanams.ap.gov.in/home/dashboard"
 
 
 # -------------------------
-# SCRAPE TTD WEBSITE
+# SCRAPE LATEST UPDATES
 # -------------------------
 
 def fetch_updates():
 
-    response = requests.get(URL, timeout=20)
+    response = requests.get(URL, timeout=30)
 
     soup = BeautifulSoup(response.text, "html.parser")
 
     updates = []
 
-    items = soup.find_all("li")
+    blocks = soup.find_all("div")
 
-    for item in items:
+    for block in blocks:
 
-        text = item.get_text(strip=True)
+        text = block.get_text(" ", strip=True)
 
-        if "New" in text:
+        if "NEW" in text:
 
-            clean = text.replace("New", "").strip()
+            clean = text.replace("NEW", "").strip()
 
-            if len(clean) > 5:
+            if len(clean) > 30:
                 updates.append(clean)
 
-    return updates
+    return list(dict.fromkeys(updates))  # remove duplicates
 
 
 # -------------------------
-# FORMAT MESSAGE
+# FORMAT TELEGRAM MESSAGE
 # -------------------------
 
 def format_message(updates):
@@ -57,7 +64,7 @@ def format_message(updates):
         message = f"🛕 TTD NEW UPDATES\n\n📅 {now}\n\n"
 
         for i, u in enumerate(updates, 1):
-            message += f"{i}. {u}\n"
+            message += f"{i}. {u}\n\n"
 
     else:
 
@@ -79,11 +86,15 @@ No new notifications today.
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
-    keyboard = [[InlineKeyboardButton("🔍 Check TTD Updates", callback_data="check")]]
+    keyboard = [
+        [InlineKeyboardButton("🔍 Check TTD Updates", callback_data="check")]
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         "🛕 TTD Update Bot\n\nClick the button below to check latest updates.",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=reply_markup
     )
 
 
@@ -104,7 +115,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # -------------------------
-# DAILY SUMMARY
+# DAILY 8 AM SUMMARY
 # -------------------------
 
 async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
@@ -113,11 +124,14 @@ async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
 
     message = format_message(updates)
 
-    await context.bot.send_message(chat_id=CHAT_ID, text=message)
+    await context.bot.send_message(
+        chat_id=CHAT_ID,
+        text=message
+    )
 
 
 # -------------------------
-# MAIN
+# MAIN FUNCTION
 # -------------------------
 
 def main():
@@ -140,6 +154,8 @@ def main():
 
     app.run_polling()
 
+
+# -------------------------
 
 if __name__ == "__main__":
     main()
