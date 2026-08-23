@@ -1131,7 +1131,7 @@ def check_mail():
 
 
         # Only REPORT emails
-        if SUBJECT_KEYWORD not in subject.upper():
+        if not re.search(r"\bREPORT\b", subject, re.IGNORECASE):
 
             processed_uids.add(
                 uid
