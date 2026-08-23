@@ -2,13 +2,13 @@ import imaplib
 import email
 from email.header import decode_header
 import os
-import requests
-import time
-import json
 import re
+import json
+import time
+import requests
+import pdfplumber
 from io import BytesIO
 from datetime import datetime, timedelta
-import pdfplumber
 
 
 # ============================================================
@@ -17,16 +17,15 @@ import pdfplumber
 
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 IMAP_SERVER = "imap.gmail.com"
 
-KEYWORD = "REPORT"
+SUBJECT_KEYWORD = "REPORT"
 
 CHECK_INTERVAL = 30
-
-RECENT_EMAIL_LIMIT = 50
 
 STATE_FILE = "invoice_agent_state.json"
 
@@ -36,7 +35,11 @@ STATE_FILE = "invoice_agent_state.json"
 # ============================================================
 
 def now_ist():
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+    return datetime.utcnow() + timedelta(
+        hours=5,
+        minutes=30
+    )
 
 
 # ============================================================
@@ -69,20 +72,30 @@ def send_telegram(message):
 # TEXT HELPERS
 # ============================================================
 
+def clean(text):
+
+    if not text:
+        return ""
+
+    return re.sub(
+        r"\s+",
+        " ",
+        text
+    ).strip()
+
+
 def safe_decode(value):
 
     if not value:
         return ""
 
-    parts = decode_header(value)
+    result = []
 
-    output = []
-
-    for part, encoding in parts:
+    for part, encoding in decode_header(value):
 
         if isinstance(part, bytes):
 
-            output.append(
+            result.append(
                 part.decode(
                     encoding or "utf-8",
                     errors="replace"
@@ -91,37 +104,14 @@ def safe_decode(value):
 
         else:
 
-            output.append(str(part))
+            result.append(str(part))
 
-    return "".join(output)
-
-
-def clean(value):
-
-    if not value:
-        return ""
-
-    return re.sub(
-        r"\s+",
-        " ",
-        value
-    ).strip()
+    return "".join(result)
 
 
-def money(value):
+def format_money(value):
 
-    if not value:
-        return ""
-
-    return value.replace(
-        ",",
-        ""
-    ).strip()
-
-
-def money_display(value):
-
-    if not value:
+    if value in ("", None):
         return ""
 
     try:
@@ -143,8 +133,8 @@ def load_state():
 
         return {
             "initialized": False,
-            "processed_invoices": [],
-            "processed_uids": []
+            "processed_uids": [],
+            "processed_invoices": []
         }
 
     try:
@@ -157,20 +147,25 @@ def load_state():
 
             return json.load(f)
 
-    except Exception as e:
-
-        print(
-            f"State file could not be read: {e}"
-        )
+    except Exception:
 
         return {
             "initialized": False,
-            "processed_invoices": [],
-            "processed_uids": []
+            "processed_uids": [],
+            "processed_invoices": []
         }
 
 
 def save_state(state):
+
+    state["processed_uids"] = list(
+        dict.fromkeys(
+            state.get(
+                "processed_uids",
+                []
+            )
+        )
+    )[-2000:]
 
     state["processed_invoices"] = list(
         dict.fromkeys(
@@ -180,15 +175,6 @@ def save_state(state):
             )
         )
     )[-2000:]
-
-    state["processed_uids"] = list(
-        dict.fromkeys(
-            state.get(
-                "processed_uids",
-                []
-            )
-        )
-    )[-1000:]
 
     with open(
         STATE_FILE,
@@ -204,277 +190,411 @@ def save_state(state):
 
 
 # ============================================================
-# PDF WORD HELPERS
+# PDF TEXT
 # ============================================================
 
-def get_words(pdf_bytes):
+def extract_pdf_text(pdf_bytes):
 
-    words = []
+    pages = []
 
     with pdfplumber.open(
         BytesIO(pdf_bytes)
     ) as pdf:
 
-        for page_number, page in enumerate(pdf.pages):
+        for page in pdf.pages:
 
-            page_words = page.extract_words(
-                x_tolerance=2,
-                y_tolerance=3,
-                keep_blank_chars=False
-            )
+            text = page.extract_text()
 
-            for word in page_words:
+            if text:
 
-                word["page"] = page_number
+                pages.append(text)
 
-                words.append(word)
-
-    return words
+    return "\n".join(pages)
 
 
-def normalize_word(word):
+# ============================================================
+# INDIAN NUMBER WORDS
+# ============================================================
 
-    return re.sub(
-        r"[^A-Za-z0-9@%:./-]",
-        "",
-        word or ""
+ONES = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19
+}
+
+
+TENS = {
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90
+}
+
+
+SCALES = {
+    "thousand": 1_000,
+    "thousands": 1_000,
+    "lakh": 100_000,
+    "lakhs": 100_000,
+    "crore": 10_000_000,
+    "crores": 10_000_000
+}
+
+
+def words_to_number(text):
+
+    words = re.findall(
+        r"[A-Za-z]+",
+        text.lower()
     )
 
-
-def amount_pattern(value):
-
-    return re.fullmatch(
-        r"\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?"
-        r"|\d+(?:\.\d{1,2})?",
-        value or ""
-    )
-
-
-def get_numeric_amounts(words):
-
-    results = []
+    total = 0
+    current = 0
 
     for word in words:
 
-        text = normalize_word(
-            word["text"]
-        )
+        if word in ONES:
 
-        if amount_pattern(text):
+            current += ONES[word]
 
-            try:
+        elif word in TENS:
 
-                number = float(
-                    text.replace(",", "")
-                )
+            current += TENS[word]
 
-                # Ignore tiny integers that are clearly
-                # quantities, HSN codes, etc.
-                if number >= 100:
+        elif word == "hundred":
 
-                    results.append({
-                        "value": text.replace(",", ""),
-                        "number": number,
-                        "x0": word["x0"],
-                        "x1": word["x1"],
-                        "top": word["top"],
-                        "bottom": word["bottom"],
-                        "page": word["page"]
-                    })
+            current *= 100
 
-            except Exception:
-                pass
+        elif word in SCALES:
 
-    return results
+            total += current * SCALES[word]
+            current = 0
+
+    return total + current
 
 
 # ============================================================
-# FIND AMOUNT BESIDE A LABEL
+# FIND AMOUNT WRITTEN IN WORDS
 # ============================================================
 
-def find_amount_near_label(
-    words,
-    label_patterns,
-    prefer_right=True
-):
+def amount_from_words(text):
 
-    candidates = []
+    pattern = (
+        r"([A-Za-z\s-]+?)"
+        r"\s+Rupees?\s+only"
+    )
 
-    for i, word in enumerate(words):
+    matches = re.findall(
+        pattern,
+        text,
+        re.IGNORECASE
+    )
 
-        text = clean(
-            word["text"]
-        ).lower()
+    if not matches:
 
-        # Look at the current word and nearby words
-        combined = text
+        return None
 
-        if i + 1 < len(words):
+    # Usually the final one is the invoice amount
+    phrase = matches[-1]
 
-            combined2 = clean(
-                words[i + 1]["text"]
-            ).lower()
+    number = words_to_number(
+        phrase
+    )
 
-            combined_pair = (
-                combined + " " + combined2
+    if number <= 0:
+
+        return None
+
+    return float(number)
+
+
+# ============================================================
+# FIND MONEY VALUES
+# ============================================================
+
+def extract_money_values(text):
+
+    pattern = (
+        r"(?<![\d.])"
+        r"(\d{1,3}(?:,\d{3})+(?:\.\d{2})?"
+        r"|\d+\.\d{2})"
+        r"(?![\d.])"
+    )
+
+    values = []
+
+    for match in re.finditer(
+        pattern,
+        text
+    ):
+
+        raw = match.group(1)
+
+        try:
+
+            number = float(
+                raw.replace(",", "")
             )
 
-        else:
-
-            combined_pair = combined
-
-
-        matched = False
-        label_end_index = i
-
-
-        for pattern in label_patterns:
-
-            if re.search(
-                pattern,
-                combined,
-                re.IGNORECASE
-            ):
-
-                matched = True
-                label_end_index = i
-                break
-
-
-            if re.search(
-                pattern,
-                combined_pair,
-                re.IGNORECASE
-            ):
-
-                matched = True
-                label_end_index = i + 1
-                break
-
-
-        if not matched:
-
-            continue
-
-
-        label_word = words[label_end_index]
-
-        label_top = label_word["top"]
-
-        label_x1 = label_word["x1"]
-
-
-        # Search words on approximately the same line
-        same_line = []
-
-        for candidate in words:
-
-            if candidate["page"] != word["page"]:
-                continue
-
-            if abs(
-                candidate["top"] - label_top
-            ) > 6:
-
-                continue
-
-            if prefer_right:
-
-                if candidate["x0"] < label_x1 - 3:
-                    continue
-
-            text_candidate = normalize_word(
-                candidate["text"]
+            values.append(
+                number
             )
 
-            if amount_pattern(
-                text_candidate
-            ):
+        except Exception:
 
-                try:
+            pass
 
-                    number = float(
-                        text_candidate.replace(",", "")
-                    )
-
-                    if number >= 100:
-
-                        same_line.append({
-                            "value": text_candidate.replace(",", ""),
-                            "number": number,
-                            "x0": candidate["x0"],
-                            "top": candidate["top"],
-                            "page": candidate["page"]
-                        })
-
-                except Exception:
-                    pass
+    return values
 
 
-        if same_line:
+# ============================================================
+# FIND FINAL AMOUNT
+# ============================================================
 
-            # nearest amount to the label
-            same_line.sort(
-                key=lambda x: x["x0"]
-            )
+def find_final_amount(text):
 
-            candidates.append(
-                same_line[0]
-            )
+    money_values = extract_money_values(
+        text
+    )
 
-
-    if not candidates:
+    if not money_values:
 
         return ""
 
+    # --------------------------------------------------------
+    # BEST METHOD:
+    #
+    # Match the amount written in words.
+    #
+    # Example Invoice 6:
+    #
+    # Sixty Five Thousand Nine Hundred Fifty Nine Rupees only
+    #
+    # -> 65959
+    #
+    # Actual PDF amount:
+    #
+    # 65958.95
+    #
+    # Difference is only rounding.
+    # --------------------------------------------------------
 
-    # Bottom-most matching label is generally the final
-    # financial total in these invoices.
-    candidates.sort(
-        key=lambda x: (
-            x["page"],
-            x["top"]
-        )
+    words_amount = amount_from_words(
+        text
     )
 
-    return candidates[-1]["value"]
+    if words_amount is not None:
+
+        matching = []
+
+        for value in money_values:
+
+            if abs(
+                value - words_amount
+            ) <= 1.00:
+
+                matching.append(
+                    value
+                )
+
+        if matching:
+
+            # If several are close, choose the largest
+            return max(
+                matching
+            )
+
+
+    # --------------------------------------------------------
+    # SECOND METHOD:
+    #
+    # Look for Total Amount.
+    # --------------------------------------------------------
+
+    total_matches = re.findall(
+        r"Total\s+Amount\s*:?\s*"
+        r"([\d,]+\.\d{2})",
+        text,
+        re.IGNORECASE
+    )
+
+    if total_matches:
+
+        try:
+
+            return float(
+                total_matches[0].replace(
+                    ",",
+                    ""
+                )
+            )
+
+        except Exception:
+
+            pass
+
+
+    # --------------------------------------------------------
+    # THIRD METHOD:
+    #
+    # Net / Nett Amount
+    # --------------------------------------------------------
+
+    net_matches = re.findall(
+        r"Nett?\s+Amount\s*:?\s*"
+        r"([\d,]+\.\d{2})",
+        text,
+        re.IGNORECASE
+    )
+
+    if net_matches:
+
+        try:
+
+            return float(
+                net_matches[-1].replace(
+                    ",",
+                    ""
+                )
+            )
+
+        except Exception:
+
+            pass
+
+
+    # Last fallback
+    return max(
+        money_values
+    )
 
 
 # ============================================================
-# FIND TAX / CHARGE LINES
+# PRODUCT ROWS
 # ============================================================
 
-def extract_charge_lines(words):
+def extract_products(text):
+
+    products = []
+
+    pattern = re.compile(
+        r"^\s*"
+        r"(\d+)\s+"
+        r"(.+?)\s+"
+        r"(\d{4,8})\s+"
+        r"(\d+)\s+"
+        r"(\d+(?:\.\d+)?)\s+"
+        r"(\d+(?:\.\d+)?)\s+"
+        r"([\d,]+\.\d{2})"
+        r"\s*$"
+    )
+
+    for line in text.splitlines():
+
+        line = clean(line)
+
+        match = pattern.match(
+            line
+        )
+
+        if not match:
+
+            continue
+
+        products.append({
+
+            "name": clean(
+                match.group(2)
+            ),
+
+            "hsn": match.group(3),
+
+            "bags": int(
+                match.group(4)
+            ),
+
+            "quantity": float(
+                match.group(5)
+            ),
+
+            "rate": float(
+                match.group(6)
+            ),
+
+            "amount": float(
+                match.group(7).replace(
+                    ",",
+                    ""
+                )
+            )
+        })
+
+    return products
+
+
+# ============================================================
+# EXTRA CHARGES / TAXES
+# ============================================================
+
+CHARGE_LABELS = [
+    "IGST",
+    "CGST",
+    "SGST",
+    "TCS",
+    "CESS",
+    "WEIGHMENT",
+    "FREIGHT",
+    "DISCOUNT",
+    "ROUND OFF"
+]
+
+
+def extract_charges(text):
 
     charges = []
 
-    labels = [
-        r"^igst$",
-        r"^cgst$",
-        r"^sgst$",
-        r"^tcs$",
-        r"^cess$",
-        r"^weighment$"
+    lines = [
+        clean(x)
+        for x in text.splitlines()
+        if clean(x)
     ]
 
 
-    for i, word in enumerate(words):
+    for index, line in enumerate(lines):
 
-        text = clean(
-            word["text"]
-        ).lower()
+        upper = line.upper()
 
         matched_label = None
 
-        for pattern in labels:
+        for label in CHARGE_LABELS:
 
-            if re.fullmatch(
-                pattern,
-                text,
-                re.IGNORECASE
+            if re.search(
+                rf"\b{re.escape(label)}\b",
+                upper
             ):
 
-                matched_label = text.upper()
+                matched_label = label
                 break
 
 
@@ -483,582 +603,382 @@ def extract_charge_lines(words):
             continue
 
 
-        label_top = word["top"]
-        label_x1 = word["x1"]
+        # Amount on same line
+        amount_match = re.search(
+            r"([\d,]+\.\d{2})\s*$",
+            line
+        )
 
 
-        # Check same line for percentage
-        percentage = ""
+        amount = None
 
-        for candidate in words:
 
-            if candidate["page"] != word["page"]:
-                continue
+        if amount_match:
 
-            if abs(
-                candidate["top"] - label_top
-            ) > 6:
-                continue
-
-            candidate_text = clean(
-                candidate["text"]
+            amount = float(
+                amount_match.group(1)
+                .replace(",", "")
             )
 
-            if "%" in candidate_text:
 
-                percentage = candidate_text
-                break
+        # Amount on following line
+        elif index + 1 < len(lines):
 
-
-        # Find monetary amount on same line
-        possible = []
-
-        for candidate in words:
-
-            if candidate["page"] != word["page"]:
-                continue
-
-            if abs(
-                candidate["top"] - label_top
-            ) > 6:
-                continue
-
-            if candidate["x0"] < label_x1 - 3:
-                continue
-
-            candidate_text = normalize_word(
-                candidate["text"]
+            next_match = re.fullmatch(
+                r"([\d,]+\.\d{2})",
+                lines[index + 1]
             )
 
-            if not amount_pattern(
-                candidate_text
-            ):
-                continue
+            if next_match:
 
-            try:
-
-                number = float(
-                    candidate_text.replace(",", "")
+                amount = float(
+                    next_match.group(1)
+                    .replace(",", "")
                 )
 
-                if number >= 100:
 
-                    possible.append({
-                        "value": candidate_text.replace(",", ""),
-                        "x0": candidate["x0"]
-                    })
+        # Ignore zero-value tax lines
+        if amount is None:
 
-            except Exception:
-                pass
+            continue
+
+        if amount == 0:
+
+            continue
 
 
-        if possible:
+        # Capture percentage if present
+        percent = ""
 
-            possible.sort(
-                key=lambda x: x["x0"]
+        percent_match = re.search(
+            r"@?\s*(\d+(?:\.\d+)?)\s*%",
+            line
+        )
+
+        if percent_match:
+
+            percent = (
+                f" @{percent_match.group(1)}%"
             )
 
-            amount = possible[0]["value"]
 
-        else:
+        charges.append({
 
-            amount = ""
+            "label": matched_label + percent,
 
+            "amount": amount
 
-        # Don't add zero-value tax rows
-        if amount:
-
-            try:
-
-                if float(amount) != 0:
-
-                    display_label = matched_label
-
-                    if percentage:
-
-                        display_label += (
-                            f" {percentage}"
-                        )
-
-                    charges.append({
-                        "label": display_label,
-                        "amount": amount
-                    })
-
-            except Exception:
-                pass
+        })
 
 
     return charges
 
 
 # ============================================================
-# EXTRACT PRODUCT AMOUNT
+# PARTY
 # ============================================================
 
-def extract_product_amount(words):
+def extract_party(text):
 
-    # Look for Amount column values in the main invoice table.
-    # We deliberately do NOT use this as the final invoice amount.
-
-    amount_candidates = []
-
-    for word in words:
-
-        text = normalize_word(
-            word["text"]
-        )
-
-        if not amount_pattern(text):
-            continue
-
-        try:
-
-            number = float(
-                text.replace(",", "")
-            )
-
-            if number < 1000:
-                continue
-
-            amount_candidates.append({
-                "value": text.replace(",", ""),
-                "number": number,
-                "top": word["top"],
-                "x0": word["x0"],
-                "page": word["page"]
-            })
-
-        except Exception:
-            pass
-
-
-    if not amount_candidates:
-
-        return ""
-
-
-    # In the invoice table, the Amount column is usually
-    # on the right side. Use the upper/middle amount candidates
-    # rather than the bottom-most total.
-    amount_candidates.sort(
-        key=lambda x: (
-            x["page"],
-            x["top"]
-        )
+    match = re.search(
+        r"Bill\s+To\s+Party.*?"
+        r"Name\s*:\s*(.*?)"
+        r"\s+State\s*:",
+        text,
+        re.IGNORECASE | re.DOTALL
     )
 
+    if match:
 
-    # The first substantial amount is normally the product amount.
-    return amount_candidates[0]["value"]
+        return clean(
+            match.group(1)
+        )
+
+    return ""
 
 
 # ============================================================
-# EXTRACT INVOICE
+# INVOICE EXTRACTION
 # ============================================================
 
-def extract_invoice_from_pdf(pdf_bytes):
+def extract_invoice(pdf_bytes):
 
-    words = get_words(
+    text = extract_pdf_text(
         pdf_bytes
     )
 
 
-    # Full text
-    text = " ".join(
-        clean(word["text"])
-        for word in words
-    )
-
-
     # --------------------------------------------------------
-    # INVOICE NUMBER
+    # Invoice number
     # --------------------------------------------------------
 
-    invoice_no = ""
-
-    match = re.search(
-        r"Invoice\s*NO\s*[:.]?\s*"
+    invoice_match = re.search(
+        r"Invoice\s*NO\s*:?\s*"
         r"\d{4}-\d{2}/(\d+)",
         text,
         re.IGNORECASE
     )
 
-    if match:
-
-        invoice_no = match.group(1)
-
-
-    if not invoice_no:
-
-        match = re.search(
-            r"Invoice\s*(?:No|Number)"
-            r"\s*[:.]?\s*(\d+)",
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-
-            invoice_no = match.group(1)
+    invoice_no = (
+        invoice_match.group(1)
+        if invoice_match
+        else ""
+    )
 
 
     # --------------------------------------------------------
-    # DATE
+    # Date
     # --------------------------------------------------------
 
-    invoice_date = ""
-
-    match = re.search(
+    date_match = re.search(
         r"Date\s+of\s+Invoice\s*:\s*"
         r"(\d{1,2}/\d{1,2}/\d{4})",
         text,
         re.IGNORECASE
     )
 
-    if match:
-
-        invoice_date = match.group(1)
-
-
-    # --------------------------------------------------------
-    # PARTY
-    # --------------------------------------------------------
-
-    party_name = ""
-
-    match = re.search(
-        r"Name\s*:\s*(.*?)"
-        r"\s+State\s*:",
-        text,
-        re.IGNORECASE
+    invoice_date = (
+        date_match.group(1)
+        if date_match
+        else ""
     )
 
-    if match:
-
-        party_name = clean(
-            match.group(1)
-        )
-
 
     # --------------------------------------------------------
-    # VEHICLE
+    # Vehicle
     # --------------------------------------------------------
 
-    vehicle = ""
-
-    match = re.search(
+    vehicle_match = re.search(
         r"Vehicle\s+Number\s*:\s*"
-        r"([A-Z0-9\-]+)",
+        r"([A-Z0-9-]+)",
         text,
         re.IGNORECASE
     )
 
-    if match:
-
-        vehicle = match.group(1)
+    vehicle = (
+        vehicle_match.group(1)
+        if vehicle_match
+        else ""
+    )
 
 
     # --------------------------------------------------------
     # RST
     # --------------------------------------------------------
 
-    rst = ""
-
-    match = re.search(
-        r"\bRST\s+(\d+)\b",
+    rst_match = re.search(
+        r"\bRST\s+(\d+)",
         text,
         re.IGNORECASE
     )
 
-    if match:
-
-        rst = match.group(1)
+    rst = (
+        rst_match.group(1)
+        if rst_match
+        else ""
+    )
 
 
     # --------------------------------------------------------
-    # PLACE
+    # Party
     # --------------------------------------------------------
+
+    party = extract_party(
+        text
+    )
+
+
+    # --------------------------------------------------------
+    # Place
+    # --------------------------------------------------------
+
+    place_match = re.search(
+        r"Bill\s+To\s+Party.*?"
+        r"City\s*:\s*(.*?)"
+        r"\s+Phone",
+        text,
+        re.IGNORECASE | re.DOTALL
+    )
 
     place = ""
 
-    match = re.search(
-        r"City\s*:\s*"
-        r"(.+?)"
-        r"\s+State\s*:",
-        text,
-        re.IGNORECASE
-    )
-
-    if match:
+    if place_match:
 
         place = clean(
-            match.group(1)
+            place_match.group(1)
         )
 
 
     # --------------------------------------------------------
-    # PRODUCT
+    # Products
     # --------------------------------------------------------
 
-    product = ""
-
-    match = re.search(
-        r"\b\d+\s+"
-        r"([A-Za-z][A-Za-z0-9 \-]+?)\s+"
-        r"\d{4,8}\s+"
-        r"\d+\s+"
-        r"(?:\d+(?:\.\d+)?)\s+"
-        r"\d+(?:\.\d+)?\s+"
-        r"\d+(?:\.\d+)?",
+    products = extract_products(
         text
     )
 
-    if match:
-
-        product = clean(
-            match.group(1)
-        )
-
 
     # --------------------------------------------------------
-    # BAGS / QUANTITY / RATE
+    # Charges
     # --------------------------------------------------------
 
-    bags = ""
-    quantity = ""
-    rate = ""
-
-
-    # Main table row
-    match = re.search(
-        r"\b\d+\s+"
-        r".+?\s+"
-        r"\d{4,8}\s+"
-        r"(\d+)\s+"
-        r"(?:\d+(?:\.\d+)?)?\s*"
-        r"(\d+(?:\.\d+)?)\s+"
-        r"(\d+(?:\.\d+)?)",
+    charges = extract_charges(
         text
     )
 
-    if match:
-
-        bags = match.group(1)
-
-        quantity = match.group(2)
-
-        rate = match.group(3)
-
 
     # --------------------------------------------------------
-    # PRODUCT AMOUNT
+    # Final amount
     # --------------------------------------------------------
 
-    product_amount = extract_product_amount(
-        words
+    final_amount = find_final_amount(
+        text
     )
 
 
     # --------------------------------------------------------
-    # TAX / WEIGHMENT / OTHER CHARGES
+    # Totals from product rows
     # --------------------------------------------------------
 
-    charges = extract_charge_lines(
-        words
+    total_bags = sum(
+        p["bags"]
+        for p in products
+    )
+
+    total_quantity = sum(
+        p["quantity"]
+        for p in products
+    )
+
+    product_amount = sum(
+        p["amount"]
+        for p in products
     )
 
 
-    # --------------------------------------------------------
-    # FINAL TOTAL
-    #
-    # Priority:
-    #
-    # 1. Bottom-most Net Amount / Nett Amount
-    # 2. Bottom-most Total Amount
-    #
-    # We use the actual amount printed beside the label.
-    # We DO NOT calculate the final amount ourselves.
-    # --------------------------------------------------------
-
-    final_amount = ""
-
-
-    final_amount = find_amount_near_label(
-        words,
-        [
-            r"net\s*amount",
-            r"nett\s*amount"
-        ]
+    # Product names
+    product_names = ", ".join(
+        dict.fromkeys(
+            p["name"]
+            for p in products
+        )
     )
 
 
-    if not final_amount:
+    # Rate
+    if len(products) == 1:
 
-        final_amount = find_amount_near_label(
-            words,
-            [
-                r"total\s*amount"
-            ]
+        rate_text = format_money(
+            products[0]["rate"]
         )
 
+    elif len(products) > 1:
 
-    # --------------------------------------------------------
-    # FALLBACK
-    # --------------------------------------------------------
+        rate_text = "Multiple"
 
-    if not final_amount:
+    else:
 
-        # Search all monetary values and use the bottom-most
-        # substantial value on the invoice.
-        amounts = get_numeric_amounts(
-            words
-        )
-
-        if amounts:
-
-            amounts.sort(
-                key=lambda x: (
-                    x["page"],
-                    x["top"]
-                )
-            )
-
-            final_amount = amounts[-1]["value"]
+        rate_text = ""
 
 
     return {
 
-        "Invoice No": invoice_no,
-        "Invoice Date": invoice_date,
-        "Party": party_name,
-        "Vehicle": vehicle,
-        "RST": rst,
-        "Product": product,
-        "Bags": bags,
-        "Quantity": quantity,
-        "Rate": rate,
-        "Product Amount": product_amount,
-        "Charges": charges,
-        "Final Amount": final_amount,
-        "Place": place
+        "invoice_no": invoice_no,
+
+        "date": invoice_date,
+
+        "party": party,
+
+        "vehicle": vehicle,
+
+        "rst": rst,
+
+        "product": product_names,
+
+        "bags": total_bags,
+
+        "quantity": total_quantity,
+
+        "rate": rate_text,
+
+        "product_amount": product_amount,
+
+        "charges": charges,
+
+        "final_amount": final_amount,
+
+        "place": place
 
     }
 
 
 # ============================================================
-# BUILD FINANCIAL SECTION
+# TELEGRAM MESSAGE
 # ============================================================
 
-def build_financial_section(info):
-
-    lines = []
-
-    product_amount = info.get(
-        "Product Amount",
-        ""
-    )
-
-    if product_amount:
-
-        lines.append(
-            f"💰 PRODUCT AMOUNT : "
-            f"{money_display(product_amount)}"
-        )
-
-
-    for charge in info.get(
-        "Charges",
-        []
-    ):
-
-        label = charge["label"]
-
-        amount = charge["amount"]
-
-        if label == "WEIGHMENT":
-
-            lines.append(
-                f"⚖ WEIGHMENT : "
-                f"{money_display(amount)}"
-            )
-
-        else:
-
-            lines.append(
-                f"🧾 {label} : "
-                f"{money_display(amount)}"
-            )
-
-
-    final_amount = info.get(
-        "Final Amount",
-        ""
-    )
-
-    if final_amount:
-
-        lines.append(
-            "────────────────────"
-        )
-
-        lines.append(
-            f"💵 FINAL AMOUNT : "
-            f"{money_display(final_amount)}"
-        )
-
-
-    return "\n".join(
-        lines
-    )
-
-
-# ============================================================
-# TELEGRAM ALERT
-# ============================================================
-
-def process_invoice(info):
-
-    financial_section = build_financial_section(
-        info
-    )
-
+def build_message(info):
 
     message = (
         "🧾  INVOICE ALERT  🧾\n\n"
 
-        f"📄 INVOICE NO : {info['Invoice No']}\n"
-        f"📅 DATE : {info['Invoice Date']}\n\n"
+        f"📄 INVOICE NO : {info['invoice_no']}\n"
+        f"📅 DATE : {info['date']}\n\n"
 
-        f"👤 {info['Party']}\n"
-        f"🚛 VEHICLE : {info['Vehicle']}\n"
-        f"🧾 RST : {info['RST']}\n\n"
+        f"👤 {info['party']}\n"
+        f"🚛 VEHICLE : {info['vehicle']}\n"
+        f"🧾 RST : {info['rst']}\n\n"
 
-        f"🌾 PRODUCT : {info['Product']}\n"
-        f"📦 BAGS : {info['Bags']}\n"
-        f"⚖ QUANTITY : {info['Quantity']} Qntl\n"
-        f"💰 RATE : ₹{info['Rate']}\n\n"
+        f"🌾 PRODUCT : {info['product']}\n"
+        f"📦 BAGS : {info['bags']}\n"
+        f"⚖ QUANTITY : {info['quantity']:.2f} Qntl\n"
+        f"💰 RATE : {info['rate']}\n\n"
+    )
 
-        f"{financial_section}\n\n"
 
-        f"📍 PLACE : {info['Place']}\n\n"
+    # Product amount
+    if info["product_amount"]:
 
+        message += (
+            f"💰 PRODUCT AMOUNT : "
+            f"{format_money(info['product_amount'])}\n"
+        )
+
+
+    # Taxes / charges
+    for charge in info["charges"]:
+
+        message += (
+            f"🧾 {charge['label']} : "
+            f"{format_money(charge['amount'])}\n"
+        )
+
+
+    # Final amount
+    if info["final_amount"]:
+
+        message += (
+            "\n"
+            "────────────────────\n"
+            f"💵 FINAL AMOUNT : "
+            f"{format_money(info['final_amount'])}\n"
+        )
+
+
+    message += (
+        "\n"
+        f"📍 PLACE : {info['place']}\n\n"
         "▣ INVOICE RECEIVED"
     )
 
 
-    send_telegram(
-        message
-    )
+    return message
 
 
 # ============================================================
-# INITIALIZATION
+# INITIALIZE
 # ============================================================
 
-def initialize_agent(mail):
-
-    state = load_state()
+def initialize(mail, state):
 
     if state.get("initialized"):
 
@@ -1067,14 +987,13 @@ def initialize_agent(mail):
 
     print()
     print("=" * 70)
-    print("INITIALIZING INVOICE AGENT")
+    print("INITIALIZING INVOICE TELEGRAM AGENT")
     print("=" * 70)
     print(
-        "Existing REPORT emails will NOT generate Telegram alerts."
+        "Existing REPORT emails will be ignored."
     )
     print(
-        "Only new REPORT emails received after initialization "
-        "will be processed."
+        "Only new emails will generate alerts."
     )
     print("=" * 70)
 
@@ -1088,26 +1007,10 @@ def initialize_agent(mail):
 
     if status == "OK" and data and data[0]:
 
-        current_uids = data[0].split()
-
-        for uid in current_uids:
-
-            state.setdefault(
-                "processed_uids",
-                []
-            ).append(
-                uid.decode()
-            )
-
-
-    state["processed_uids"] = list(
-        dict.fromkeys(
-            state.get(
-                "processed_uids",
-                []
-            )
-        )
-    )[-1000:]
+        state["processed_uids"] = [
+            uid.decode()
+            for uid in data[0].split()
+        ]
 
 
     state["initialized"] = True
@@ -1118,18 +1021,14 @@ def initialize_agent(mail):
 
 
     print(
-        "Invoice agent initialized successfully."
-    )
-
-    print(
-        "Waiting for NEW REPORT emails..."
+        "Initialization complete."
     )
 
     return state
 
 
 # ============================================================
-# CHECK GMAIL
+# CHECK MAIL
 # ============================================================
 
 def check_mail():
@@ -1138,20 +1037,21 @@ def check_mail():
         IMAP_SERVER
     )
 
-
     mail.login(
         EMAIL_USER,
         EMAIL_PASS
     )
 
-
     mail.select(
-        "inbox"
+        "INBOX"
     )
 
 
-    state = initialize_agent(
-        mail
+    state = load_state()
+
+    state = initialize(
+        mail,
+        state
     )
 
 
@@ -1164,7 +1064,7 @@ def check_mail():
 
 
     processed_invoices = set(
-        str(x).strip()
+        str(x)
         for x in state.get(
             "processed_invoices",
             []
@@ -1190,34 +1090,25 @@ def check_mail():
         return
 
 
-    all_uids = (
-        data[0].split()
-        if data and data[0]
-        else []
-    )
+    uids = data[0].split()
 
 
-    recent_uids = all_uids[
-        -RECENT_EMAIL_LIMIT:
-    ]
+    new_count = 0
 
 
-    telegram_count = 0
+    for uid_bytes in uids:
+
+        uid = uid_bytes.decode()
 
 
-    for uid in recent_uids:
-
-        uid_text = uid.decode()
-
-
-        if uid_text in processed_uids:
+        if uid in processed_uids:
 
             continue
 
 
         status, msg_data = mail.uid(
             "fetch",
-            uid,
+            uid_bytes,
             "(RFC822)"
         )
 
@@ -1239,10 +1130,11 @@ def check_mail():
         )
 
 
-        if KEYWORD not in subject.upper():
+        # Only REPORT emails
+        if SUBJECT_KEYWORD not in subject.upper():
 
             processed_uids.add(
-                uid_text
+                uid
             )
 
             continue
@@ -1257,16 +1149,16 @@ def check_mail():
         )
 
 
-        pdf_found = False
-
-        processed_successfully = False
+        invoice_processed = False
 
 
         for part in msg.walk():
 
             filename = part.get_filename()
 
-            content_type = part.get_content_type()
+            content_type = (
+                part.get_content_type()
+            )
 
 
             is_pdf = (
@@ -1274,7 +1166,9 @@ def check_mail():
                 (
                     filename
                     and
-                    filename.lower().endswith(".pdf")
+                    filename.lower().endswith(
+                        ".pdf"
+                    )
                 )
 
                 or
@@ -1289,78 +1183,72 @@ def check_mail():
                 continue
 
 
-            pdf_found = True
-
-
-            print(
-                f"PDF found: "
-                f"{filename or 'Report.pdf'}"
-            )
-
-
-            pdf_data = part.get_payload(
+            pdf_bytes = part.get_payload(
                 decode=True
             )
 
 
-            if not pdf_data:
-
-                print(
-                    "PDF is empty."
-                )
+            if not pdf_bytes:
 
                 continue
 
 
             try:
 
-                info = extract_invoice_from_pdf(
-                    pdf_data
+                info = extract_invoice(
+                    pdf_bytes
                 )
 
 
-                invoice_no = str(
-                    info["Invoice No"]
-                ).strip()
+                invoice_no = (
+                    info["invoice_no"]
+                    .strip()
+                )
 
 
                 print(
-                    f"Invoice No : {invoice_no}"
+                    f"PDF found: "
+                    f"{filename or 'Report.pdf'}"
                 )
 
                 print(
-                    f"Party      : {info['Party']}"
+                    f"Invoice No : "
+                    f"{invoice_no}"
+                )
+
+                print(
+                    f"Party      : "
+                    f"{info['party']}"
                 )
 
                 print(
                     f"Product Amt: "
-                    f"{info['Product Amount']}"
+                    f"{format_money(info['product_amount'])}"
                 )
 
                 print(
                     f"Charges    : "
-                    f"{info['Charges']}"
+                    f"{info['charges']}"
                 )
 
                 print(
                     f"FINAL AMT  : "
-                    f"{info['Final Amount']}"
+                    f"{format_money(info['final_amount'])}"
                 )
 
 
                 if not invoice_no:
 
                     print(
-                        "WARNING: Invoice number could "
-                        "not be extracted."
+                        "Invoice number not found."
                     )
 
                     break
 
 
-                # =================================================
+                # ------------------------------------------------
                 # DUPLICATE PROTECTION
-                # =================================================
+                # ------------------------------------------------
 
                 if invoice_no in processed_invoices:
 
@@ -1370,20 +1258,24 @@ def check_mail():
                     )
 
                     print(
-                        "Telegram alert SKIPPED."
+                        "Telegram alert skipped."
                     )
 
-                    processed_successfully = True
+                    invoice_processed = True
 
                     break
 
 
-                # =================================================
-                # SEND
-                # =================================================
+                # ------------------------------------------------
+                # SEND TELEGRAM
+                # ------------------------------------------------
 
-                process_invoice(
+                message = build_message(
                     info
+                )
+
+                send_telegram(
+                    message
                 )
 
 
@@ -1396,50 +1288,37 @@ def check_mail():
                     invoice_no
                 )
 
+                new_count += 1
 
-                processed_successfully = True
+                invoice_processed = True
 
-                telegram_count += 1
-
-
-                print(
-                    f"Invoice {invoice_no} "
-                    f"saved as processed."
-                )
+                break
 
 
             except Exception as e:
 
                 print(
-                    f"Invoice processing error: {e}"
+                    "Invoice processing error:",
+                    e
                 )
 
+                break
 
-            break
 
-
-        if pdf_found and processed_successfully:
-
-            processed_uids.add(
-                uid_text
-            )
-
-        elif not pdf_found:
+        if invoice_processed:
 
             processed_uids.add(
-                uid_text
+                uid
             )
 
 
     state["processed_uids"] = list(
         processed_uids
-    )[-1000:]
-
+    )
 
     state["processed_invoices"] = list(
         processed_invoices
-    )[-2000:]
-
+    )
 
     save_state(
         state
@@ -1449,16 +1328,16 @@ def check_mail():
     mail.logout()
 
 
-    if telegram_count:
+    if new_count:
 
         print()
         print(
-            f"{telegram_count} NEW invoice alert(s) sent."
+            f"{new_count} new REPORT email(s) processed."
         )
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN
 # ============================================================
 
 if __name__ == "__main__":
@@ -1468,22 +1347,16 @@ if __name__ == "__main__":
     print("SVT INVOICE TELEGRAM AGENT")
     print("=" * 70)
     print(
-        "Watching Gmail for NEW REPORT invoice emails"
+        "Watching Gmail for REPORT invoice emails"
     )
     print(
         f"Check interval : {CHECK_INTERVAL} seconds"
     )
     print(
-        "Duplicate key  : INVOICE NUMBER"
+        "Duplicate key  : Invoice Number"
     )
     print(
-        "Financial data : READ DIRECTLY FROM INVOICE"
-    )
-    print(
-        "Final amount   : NET / FINAL TOTAL ON INVOICE"
-    )
-    print(
-        "Mode           : UPDATE / NEW MAIL ONLY"
+        "Amount method  : Invoice final amount"
     )
     print(
         "Weighment agent: UNTOUCHED"
@@ -1499,9 +1372,9 @@ if __name__ == "__main__":
 
         except Exception as e:
 
-            print()
             print(
-                f"Email check error: {e}"
+                "Email check error:",
+                e
             )
 
 
