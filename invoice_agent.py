@@ -5,6 +5,7 @@ import os
 import requests
 import time
 import re
+import json
 from io import BytesIO
 from datetime import datetime, timedelta
 import pdfplumber
@@ -21,10 +22,15 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 IMAP_SERVER = "imap.gmail.com"
 
-# Invoice emails have REPORT in the subject
 KEYWORD = "REPORT"
 
 CHECK_INTERVAL = 30
+
+# How many recent emails to inspect each cycle
+RECENT_EMAIL_LIMIT = 50
+
+# File used to remember processed Gmail UIDs
+STATE_FILE = "processed_invoices.json"
 
 
 # ============================================================
@@ -39,7 +45,7 @@ def now_ist():
 # TELEGRAM
 # ============================================================
 
-def send_telegram(message: str):
+def send_telegram(message):
 
     url = (
         f"https://api.telegram.org/"
@@ -62,7 +68,7 @@ def send_telegram(message: str):
 
 
 # ============================================================
-# HELPERS
+# SAFE TEXT DECODING
 # ============================================================
 
 def safe_decode(value):
@@ -102,6 +108,59 @@ def clean(value):
         " ",
         value
     ).strip()
+
+
+# ============================================================
+# STATE MANAGEMENT
+# ============================================================
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+
+        return {
+            "initialized": False,
+            "processed_uids": []
+        }
+
+    try:
+
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            state = json.load(f)
+
+        return state
+
+    except Exception:
+
+        return {
+            "initialized": False,
+            "processed_uids": []
+        }
+
+
+def save_state(state):
+
+    # Keep only the latest 1000 UIDs
+    state["processed_uids"] = (
+        state.get("processed_uids", [])[-1000:]
+    )
+
+    with open(
+        STATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            state,
+            f,
+            indent=2
+        )
 
 
 # ============================================================
@@ -312,7 +371,7 @@ def extract_invoice_from_pdf(pdf_bytes):
         "Quantity": quantity,
         "Rate": rate,
         "Amount": amount,
-        "Place": place,
+        "Place": place
 
     }
 
@@ -323,19 +382,19 @@ def extract_invoice_from_pdf(pdf_bytes):
 
 def process_invoice(info):
 
-    amount = info["Amount"]
-
-    if amount:
+    if info["Amount"]:
 
         try:
 
             amount_display = (
-                f"₹{float(amount):,.2f}"
+                f"₹{float(info['Amount']):,.2f}"
             )
 
-        except:
+        except Exception:
 
-            amount_display = f"₹{amount}"
+            amount_display = (
+                f"₹{info['Amount']}"
+            )
 
     else:
 
@@ -368,7 +427,82 @@ def process_invoice(info):
 
 
 # ============================================================
-# EMAIL CHECK
+# INITIALIZE AGENT
+# ============================================================
+
+def initialize_agent(mail):
+
+    state = load_state()
+
+    if state.get("initialized"):
+
+        return state
+
+
+    print()
+    print("=" * 70)
+    print("INITIALIZING INVOICE AGENT")
+    print("=" * 70)
+    print(
+        "Existing REPORT emails will NOT be sent to Telegram."
+    )
+    print(
+        "Only new REPORT emails received after startup "
+        "will generate alerts."
+    )
+    print("=" * 70)
+
+
+    # Get the current highest Gmail UID.
+    # Everything currently in the mailbox becomes historical.
+    status, data = mail.uid(
+        "search",
+        None,
+        "ALL"
+    )
+
+
+    if status == "OK" and data and data[0]:
+
+        current_uids = data[0].split()
+
+        for uid in current_uids:
+
+            uid_text = uid.decode()
+
+            state.setdefault(
+                "processed_uids",
+                []
+            ).append(
+                uid_text
+            )
+
+
+    state["processed_uids"] = list(
+        dict.fromkeys(
+            state.get("processed_uids", [])
+        )
+    )[-1000:]
+
+
+    state["initialized"] = True
+
+    save_state(state)
+
+
+    print(
+        "Invoice agent initialized successfully."
+    )
+
+    print(
+        "Waiting for NEW REPORT emails..."
+    )
+
+    return state
+
+
+# ============================================================
+# CHECK GMAIL FOR NEW REPORT EMAILS
 # ============================================================
 
 def check_mail():
@@ -377,140 +511,194 @@ def check_mail():
         IMAP_SERVER
     )
 
+
     mail.login(
         EMAIL_USER,
         EMAIL_PASS
     )
 
+
     mail.select(
         "inbox"
     )
 
-    status, messages = mail.search(
-        None,
-        "(UNSEEN)"
+
+    state = initialize_agent(
+        mail
     )
 
+
+    processed_uids = set(
+        state.get(
+            "processed_uids",
+            []
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # SEARCH ALL MESSAGE UIDs
+    # --------------------------------------------------------
+
+    status, data = mail.uid(
+        "search",
+        None,
+        "ALL"
+    )
+
+
     if status != "OK":
+
+        print(
+            "Gmail search failed."
+        )
 
         mail.logout()
 
         return
 
 
-    mail_ids = messages[0].split()
-
-    print(
-        f"[{now_ist().strftime('%d-%m-%Y %I:%M:%S %p')}] "
-        f"Unread emails: {len(mail_ids)}"
-    )
+    all_uids = data[0].split() if data and data[0] else []
 
 
-    for mail_id in mail_ids:
+    # Only inspect the most recent messages.
+    recent_uids = all_uids[
+        -RECENT_EMAIL_LIMIT:
+    ]
 
-        try:
 
-            status, msg_data = mail.fetch(
-                mail_id,
-                "(RFC822)"
+    new_found = 0
+
+
+    for uid in recent_uids:
+
+        uid_text = uid.decode()
+
+
+        # ----------------------------------------------------
+        # ALREADY PROCESSED?
+        # ----------------------------------------------------
+
+        if uid_text in processed_uids:
+
+            continue
+
+
+        # ----------------------------------------------------
+        # FETCH EMAIL
+        # ----------------------------------------------------
+
+        status, msg_data = mail.uid(
+            "fetch",
+            uid,
+            "(RFC822)"
+        )
+
+
+        if status != "OK":
+
+            continue
+
+
+        raw_email = msg_data[0][1]
+
+        msg = email.message_from_bytes(
+            raw_email
+        )
+
+
+        subject = safe_decode(
+            msg.get("Subject")
+        )
+
+
+        # ----------------------------------------------------
+        # ONLY REPORT SUBJECTS
+        # ----------------------------------------------------
+
+        if KEYWORD not in subject.upper():
+
+            # Mark this UID as checked.
+            # This prevents repeatedly checking unrelated
+            # old emails.
+            processed_uids.add(
+                uid_text
             )
 
-            if status != "OK":
+            continue
+
+
+        new_found += 1
+
+
+        print()
+        print("=" * 70)
+        print("NEW REPORT EMAIL DETECTED")
+        print("=" * 70)
+        print(
+            f"Subject : {subject}"
+        )
+
+
+        pdf_found = False
+
+        processed_successfully = False
+
+
+        # ----------------------------------------------------
+        # FIND PDF
+        # ----------------------------------------------------
+
+        for part in msg.walk():
+
+            filename = part.get_filename()
+
+            content_type = part.get_content_type()
+
+
+            is_pdf = (
+
+                (
+                    filename
+                    and
+                    filename.lower().endswith(".pdf")
+                )
+
+                or
+
+                content_type == "application/pdf"
+
+            )
+
+
+            if not is_pdf:
 
                 continue
 
 
-            raw_email = msg_data[0][1]
-
-            msg = email.message_from_bytes(
-                raw_email
-            )
-
-
-            subject = safe_decode(
-                msg.get("Subject")
-            )
+            pdf_found = True
 
 
             print(
-                f"Checking: {subject}"
+                f"PDF found: {filename or 'attachment.pdf'}"
             )
 
 
-            # ------------------------------------------------
-            # ONLY REPORT EMAILS
-            # ------------------------------------------------
-
-            if KEYWORD not in subject.upper():
-
-                # IMPORTANT:
-                # Leave unrelated emails untouched.
-                continue
-
-
-            print(
-                "REPORT invoice email detected."
+            pdf_data = part.get_payload(
+                decode=True
             )
 
 
-            pdf_found = False
-
-            processed_successfully = False
-
-
-            # ------------------------------------------------
-            # FIND PDF
-            # ------------------------------------------------
-
-            for part in msg.walk():
-
-                filename = part.get_filename()
-
-                content_type = part.get_content_type()
-
-
-                if not (
-
-                    (
-                        filename
-                        and
-                        filename.lower().endswith(".pdf")
-                    )
-
-                    or
-
-                    content_type == "application/pdf"
-
-                ):
-
-                    continue
-
-
-                pdf_found = True
-
+            if not pdf_data:
 
                 print(
-                    f"Invoice PDF found: {filename}"
+                    "PDF is empty."
                 )
 
-
-                pdf_data = part.get_payload(
-                    decode=True
-                )
+                continue
 
 
-                if not pdf_data:
-
-                    print(
-                        "PDF attachment is empty."
-                    )
-
-                    continue
-
-
-                # ------------------------------------------------
-                # EXTRACT
-                # ------------------------------------------------
+            try:
 
                 info = extract_invoice_from_pdf(
                     pdf_data
@@ -518,20 +706,20 @@ def check_mail():
 
 
                 print(
-                    f"Invoice No: {info['Invoice No']}"
+                    f"Invoice No : {info['Invoice No']}"
                 )
 
                 print(
-                    f"Party: {info['Party']}"
+                    f"Party      : {info['Party']}"
                 )
 
                 print(
-                    f"Amount: {info['Amount']}"
+                    f"Amount     : {info['Amount']}"
                 )
 
 
                 # ------------------------------------------------
-                # SEND TELEGRAM
+                # TELEGRAM
                 # ------------------------------------------------
 
                 process_invoice(
@@ -540,57 +728,77 @@ def check_mail():
 
 
                 print(
-                    "Telegram invoice alert sent."
+                    "Telegram alert sent successfully."
                 )
 
 
                 processed_successfully = True
 
 
-                # Only process the first PDF
-                break
-
-
-            # ------------------------------------------------
-            # MARK ONLY SUCCESSFULLY PROCESSED INVOICE EMAIL
-            # ------------------------------------------------
-
-            if pdf_found and processed_successfully:
-
-                mail.store(
-                    mail_id,
-                    "+FLAGS",
-                    "\\Seen"
-                )
+            except Exception as e:
 
                 print(
-                    "Invoice email marked as Seen."
-                )
-
-            elif not pdf_found:
-
-                print(
-                    "REPORT email found but no PDF. "
-                    "Email left unread."
+                    f"Invoice processing error: {e}"
                 )
 
 
-        except Exception as e:
+            # Only process first PDF
+            break
 
-            print(
-                f"Invoice processing error: {e}"
+
+        # ----------------------------------------------------
+        # REMEMBER EMAIL
+        # ----------------------------------------------------
+
+        if pdf_found and processed_successfully:
+
+            processed_uids.add(
+                uid_text
             )
 
-            # IMPORTANT:
-            # Failed invoice remains unread so it can
-            # be retried on the next cycle.
+            print(
+                "Invoice UID saved as processed."
+            )
+
+        elif not pdf_found:
+
+            print(
+                "REPORT email has no PDF."
+            )
+
+            # Remember it so we don't repeatedly process
+            # the same bad email.
+            processed_uids.add(
+                uid_text
+            )
+
+
+    # --------------------------------------------------------
+    # SAVE STATE
+    # --------------------------------------------------------
+
+    state["processed_uids"] = list(
+        processed_uids
+    )[-1000:]
+
+
+    save_state(
+        state
+    )
 
 
     mail.logout()
 
 
+    if new_found:
+
+        print(
+            f"{new_found} new REPORT email(s) processed."
+        )
+
+
 # ============================================================
-# MAIN CONTINUOUS LOOP
+# MAIN LOOP
 # ============================================================
 
 if __name__ == "__main__":
@@ -599,9 +807,10 @@ if __name__ == "__main__":
     print("=" * 70)
     print("SVT INVOICE TELEGRAM AGENT")
     print("=" * 70)
-    print("Watching Gmail for REPORT invoice emails")
+    print("Watching Gmail for NEW REPORT invoice emails")
     print(f"Check interval : {CHECK_INTERVAL} seconds")
-    print("Weighment agent : UNTOUCHED")
+    print("Mode           : UPDATE / NEW MAIL ONLY")
+    print("Weighment agent: UNTOUCHED")
     print("=" * 70)
 
 
