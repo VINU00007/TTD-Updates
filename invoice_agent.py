@@ -326,14 +326,14 @@ def extract_invoice_from_pdf(pdf_bytes):
 
 
     # --------------------------------------------------------
-    # PRODUCT / BAGS / QUANTITY / RATE / AMOUNT
+    # PRODUCT / BAGS / QUANTITY / RATE / PRODUCT AMOUNT
     # --------------------------------------------------------
 
     product = ""
     bags = ""
     quantity = ""
     rate = ""
-    amount = ""
+    product_amount = ""
 
     match = re.search(
         r"\n1\s+"
@@ -363,20 +363,139 @@ def extract_invoice_from_pdf(pdf_bytes):
             ""
         )
 
-        amount = match.group(6).replace(
+        product_amount = match.group(6).replace(
             ",",
             ""
         )
 
 
     # --------------------------------------------------------
-    # AMOUNT FALLBACK
+    # TAX / CHARGES
+    #
+    # This is the ONLY new extraction section.
     # --------------------------------------------------------
 
-    if not amount:
+    charges = []
+
+    charge_patterns = [
+
+        (
+            r"(IGST\s*@?\s*\d+(?:\.\d+)?%)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(CGST\s*@?\s*\d+(?:\.\d+)?%)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(SGST\s*@?\s*\d+(?:\.\d+)?%)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(TCS\s*@?\s*\d+(?:\.\d+)?%)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(WEIGHMENT)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(FREIGHT)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        ),
+
+        (
+            r"(ROUND\s*OFF)"
+            r"\s*:?\s*"
+            r"([0-9,]+(?:\.\d+)?)"
+        )
+
+    ]
+
+
+    for pattern in charge_patterns:
+
+        matches = re.findall(
+            pattern,
+            text,
+            re.IGNORECASE
+        )
+
+        for label, value in matches:
+
+            try:
+
+                numeric_value = float(
+                    value.replace(
+                        ",",
+                        ""
+                    )
+                )
+
+            except Exception:
+
+                continue
+
+
+            charges.append({
+
+                "label": clean(label),
+
+                "amount": numeric_value
+
+            })
+
+
+    # --------------------------------------------------------
+    # FINAL INVOICE AMOUNT
+    #
+    # Priority:
+    #
+    # 1. Total / Final amount explicitly printed
+    # 2. Net / Nett amount
+    #
+    # We DO NOT calculate this from quantity × rate.
+    # --------------------------------------------------------
+
+    final_amount = ""
+
+
+    # Common "Total Amount" format
+    match = re.search(
+        r"(?:Total\s+Amount|Final\s+Amount)"
+        r"\s*:?\s*"
+        r"(?:₹\s*)?"
+        r"([0-9,]+(?:\.\d+)?)",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+
+        final_amount = match.group(1).replace(
+            ",",
+            ""
+        )
+
+
+    # "Net Amount" / "Nett Amount" fallback
+    if not final_amount:
 
         match = re.search(
-            r"Total\s+Amount\s*:\s*"
+            r"Nett?\s+Amount"
+            r"\s*:?\s*"
+            r"(?:₹\s*)?"
             r"([0-9,]+(?:\.\d+)?)",
             text,
             re.IGNORECASE
@@ -384,10 +503,48 @@ def extract_invoice_from_pdf(pdf_bytes):
 
         if match:
 
-            amount = match.group(1).replace(
+            final_amount = match.group(1).replace(
                 ",",
                 ""
             )
+
+
+    # --------------------------------------------------------
+    # IMPORTANT FALLBACK
+    #
+    # Some invoice PDFs place the final number on a separate
+    # line after "Total Amount".
+    # --------------------------------------------------------
+
+    if not final_amount:
+
+        match = re.search(
+            r"(?:Total\s+Amount|Final\s+Amount|"
+            r"Nett?\s+Amount)"
+            r"\s*[:\-]?\s*\n\s*"
+            r"(?:₹\s*)?"
+            r"([0-9,]+(?:\.\d+)?)",
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            final_amount = match.group(1).replace(
+                ",",
+                ""
+            )
+
+
+    # --------------------------------------------------------
+    # IF NO FINAL AMOUNT LABEL EXISTS
+    #
+    # Keep the original product amount rather than guessing.
+    # --------------------------------------------------------
+
+    if not final_amount:
+
+        final_amount = product_amount
 
 
     # --------------------------------------------------------
@@ -422,7 +579,16 @@ def extract_invoice_from_pdf(pdf_bytes):
         "Bags": bags,
         "Quantity": quantity,
         "Rate": rate,
-        "Amount": amount,
+
+        # Original product amount
+        "Product Amount": product_amount,
+
+        # Taxes / additional charges
+        "Charges": charges,
+
+        # FINAL invoice amount including taxes/charges
+        "Amount": final_amount,
+
         "Place": place
 
     }
@@ -433,6 +599,10 @@ def extract_invoice_from_pdf(pdf_bytes):
 # ============================================================
 
 def process_invoice(info):
+
+    # --------------------------------------------------------
+    # FINAL AMOUNT
+    # --------------------------------------------------------
 
     if info["Amount"]:
 
@@ -453,6 +623,56 @@ def process_invoice(info):
         amount_display = "₹-"
 
 
+    # --------------------------------------------------------
+    # PRODUCT AMOUNT
+    # --------------------------------------------------------
+
+    product_amount_display = ""
+
+    if info.get("Product Amount"):
+
+        try:
+
+            product_amount_display = (
+                f"💰 PRODUCT AMOUNT : "
+                f"₹{float(info['Product Amount']):,.2f}\n"
+            )
+
+        except Exception:
+
+            product_amount_display = (
+                f"💰 PRODUCT AMOUNT : "
+                f"₹{info['Product Amount']}\n"
+            )
+
+
+    # --------------------------------------------------------
+    # CHARGES / TAXES
+    # --------------------------------------------------------
+
+    charges_text = ""
+
+    for charge in info.get(
+        "Charges",
+        []
+    ):
+
+        try:
+
+            charges_text += (
+                f"🧾 {charge['label']} : "
+                f"₹{charge['amount']:,.2f}\n"
+            )
+
+        except Exception:
+
+            pass
+
+
+    # --------------------------------------------------------
+    # TELEGRAM MESSAGE
+    # --------------------------------------------------------
+
     message = (
         "🧾  INVOICE ALERT  🧾\n\n"
 
@@ -468,14 +688,24 @@ def process_invoice(info):
         f"⚖ QUANTITY : {info['Quantity']} Qntl\n\n"
 
         f"💰 RATE : ₹{info['Rate']}\n"
-        f"💵 INVOICE AMOUNT : {amount_display}\n\n"
+
+        f"{product_amount_display}"
+
+        f"{charges_text}"
+
+        "────────────────────\n"
+
+        f"💵 FINAL AMOUNT : {amount_display}\n\n"
 
         f"📍 PLACE : {info['Place']}\n\n"
 
         "▣ INVOICE RECEIVED"
     )
 
-    send_telegram(message)
+
+    send_telegram(
+        message
+    )
 
 
 # ============================================================
@@ -540,16 +770,6 @@ def initialize_agent(mail):
         )
     )[-1000:]
 
-
-    # --------------------------------------------------------
-    # IMPORTANT:
-    #
-    # We are NOT adding invoice numbers here.
-    #
-    # Existing invoices are not considered processed by
-    # invoice number. They are simply historical because
-    # their Gmail UID existed when the agent started.
-    # --------------------------------------------------------
 
     state["initialized"] = True
 
@@ -797,7 +1017,15 @@ def check_mail():
                 )
 
                 print(
-                    f"Amount     : {info['Amount']}"
+                    f"Product Amt: {info['Product Amount']}"
+                )
+
+                print(
+                    f"Charges    : {info['Charges']}"
+                )
+
+                print(
+                    f"Final Amt  : {info['Amount']}"
                 )
 
 
