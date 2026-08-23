@@ -22,16 +22,12 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 IMAP_SERVER = "imap.gmail.com"
 
-# Invoice emails have REPORT in the subject
 KEYWORD = "REPORT"
 
-# Gmail check interval
 CHECK_INTERVAL = 30
 
-# Number of latest Gmail messages inspected each cycle
 RECENT_EMAIL_LIMIT = 50
 
-# Persistent duplicate-protection file
 STATE_FILE = "invoice_agent_state.json"
 
 
@@ -153,7 +149,6 @@ def load_state():
 
 def save_state(state):
 
-    # Keep the state reasonably small
     state["processed_invoices"] = list(
         dict.fromkeys(
             state.get(
@@ -223,7 +218,6 @@ def extract_invoice_from_pdf(pdf_bytes):
         invoice_no = match.group(1)
 
 
-    # Fallback invoice number pattern
     if not invoice_no:
 
         match = re.search(
@@ -275,7 +269,6 @@ def extract_invoice_from_pdf(pdf_bytes):
         )
 
 
-    # Fallback party pattern
     if not party_name:
 
         match = re.search(
@@ -371,8 +364,6 @@ def extract_invoice_from_pdf(pdf_bytes):
 
     # --------------------------------------------------------
     # TAX / CHARGES
-    #
-    # This is the ONLY new extraction section.
     # --------------------------------------------------------
 
     charges = []
@@ -447,7 +438,6 @@ def extract_invoice_from_pdf(pdf_bytes):
 
                 continue
 
-
             charges.append({
 
                 "label": clean(label),
@@ -460,40 +450,46 @@ def extract_invoice_from_pdf(pdf_bytes):
     # --------------------------------------------------------
     # FINAL INVOICE AMOUNT
     #
-    # Priority:
+    # IMPORTANT:
     #
-    # 1. Total / Final amount explicitly printed
-    # 2. Net / Nett amount
+    # Nett Amount is the actual final payable amount.
     #
-    # We DO NOT calculate this from quantity × rate.
+    # Total Amount is normally the amount BEFORE GST/taxes.
+    #
+    # Therefore Nett Amount MUST be checked FIRST.
     # --------------------------------------------------------
 
     final_amount = ""
 
 
-    # Common "Total Amount" format
-    match = re.search(
-        r"(?:Total\s+Amount|Final\s+Amount)"
-        r"\s*:?\s*"
+    # --------------------------------------------------------
+    # 1. NETT AMOUNT — PRIMARY SOURCE
+    # --------------------------------------------------------
+
+    net_matches = re.findall(
+        r"Nett?\s+Amount\s*:?\s*"
         r"(?:₹\s*)?"
         r"([0-9,]+(?:\.\d+)?)",
         text,
         re.IGNORECASE
     )
 
-    if match:
+    if net_matches:
 
-        final_amount = match.group(1).replace(
+        final_amount = net_matches[-1].replace(
             ",",
             ""
         )
 
 
-    # "Net Amount" / "Nett Amount" fallback
+    # --------------------------------------------------------
+    # 2. FINAL AMOUNT
+    # --------------------------------------------------------
+
     if not final_amount:
 
         match = re.search(
-            r"Nett?\s+Amount"
+            r"Final\s+Amount"
             r"\s*:?\s*"
             r"(?:₹\s*)?"
             r"([0-9,]+(?:\.\d+)?)",
@@ -510,17 +506,38 @@ def extract_invoice_from_pdf(pdf_bytes):
 
 
     # --------------------------------------------------------
-    # IMPORTANT FALLBACK
+    # 3. TOTAL AMOUNT
     #
-    # Some invoice PDFs place the final number on a separate
-    # line after "Total Amount".
+    # Only fallback.
     # --------------------------------------------------------
 
     if not final_amount:
 
         match = re.search(
-            r"(?:Total\s+Amount|Final\s+Amount|"
-            r"Nett?\s+Amount)"
+            r"Total\s+Amount"
+            r"\s*:?\s*"
+            r"(?:₹\s*)?"
+            r"([0-9,]+(?:\.\d+)?)",
+            text,
+            re.IGNORECASE
+        )
+
+        if match:
+
+            final_amount = match.group(1).replace(
+                ",",
+                ""
+            )
+
+
+    # --------------------------------------------------------
+    # 4. SEPARATE-LINE FINAL / NETT AMOUNT
+    # --------------------------------------------------------
+
+    if not final_amount:
+
+        match = re.search(
+            r"(?:Final\s+Amount|Nett?\s+Amount)"
             r"\s*[:\-]?\s*\n\s*"
             r"(?:₹\s*)?"
             r"([0-9,]+(?:\.\d+)?)",
@@ -537,9 +554,9 @@ def extract_invoice_from_pdf(pdf_bytes):
 
 
     # --------------------------------------------------------
-    # IF NO FINAL AMOUNT LABEL EXISTS
+    # 5. LAST SAFE FALLBACK
     #
-    # Keep the original product amount rather than guessing.
+    # Do NOT guess using random numbers in the PDF.
     # --------------------------------------------------------
 
     if not final_amount:
@@ -571,22 +588,27 @@ def extract_invoice_from_pdf(pdf_bytes):
     return {
 
         "Invoice No": invoice_no,
+
         "Invoice Date": invoice_date,
+
         "Party": party_name,
+
         "Vehicle": vehicle,
+
         "RST": rst,
+
         "Product": product,
+
         "Bags": bags,
+
         "Quantity": quantity,
+
         "Rate": rate,
 
-        # Original product amount
         "Product Amount": product_amount,
 
-        # Taxes / additional charges
         "Charges": charges,
 
-        # FINAL invoice amount including taxes/charges
         "Amount": final_amount,
 
         "Place": place
@@ -647,7 +669,7 @@ def process_invoice(info):
 
 
     # --------------------------------------------------------
-    # CHARGES / TAXES
+    # TAXES / CHARGES
     # --------------------------------------------------------
 
     charges_text = ""
@@ -677,14 +699,19 @@ def process_invoice(info):
         "🧾  INVOICE ALERT  🧾\n\n"
 
         f"📄 INVOICE NO : {info['Invoice No']}\n"
+
         f"📅 DATE : {info['Invoice Date']}\n\n"
 
         f"👤 {info['Party']}\n"
+
         f"🚛 VEHICLE : {info['Vehicle']}\n"
+
         f"🧾 RST : {info['RST']}\n\n"
 
         f"🌾 PRODUCT : {info['Product']}\n"
+
         f"📦 BAGS : {info['Bags']}\n"
+
         f"⚖ QUANTITY : {info['Quantity']} Qntl\n\n"
 
         f"💰 RATE : ₹{info['Rate']}\n"
@@ -725,20 +752,18 @@ def initialize_agent(mail):
     print("=" * 70)
     print("INITIALIZING INVOICE AGENT")
     print("=" * 70)
+
     print(
         "Existing REPORT emails will NOT generate Telegram alerts."
     )
+
     print(
         "Only new REPORT emails received after initialization "
         "will be processed."
     )
+
     print("=" * 70)
 
-
-    # --------------------------------------------------------
-    # Record all currently existing Gmail UIDs.
-    # This creates our starting point.
-    # --------------------------------------------------------
 
     status, data = mail.uid(
         "search",
@@ -799,12 +824,10 @@ def check_mail():
         IMAP_SERVER
     )
 
-
     mail.login(
         EMAIL_USER,
         EMAIL_PASS
     )
-
 
     mail.select(
         "inbox"
@@ -833,10 +856,6 @@ def check_mail():
     )
 
 
-    # --------------------------------------------------------
-    # GET ALL EMAIL UIDs
-    # --------------------------------------------------------
-
     status, data = mail.uid(
         "search",
         None,
@@ -862,10 +881,6 @@ def check_mail():
     )
 
 
-    # --------------------------------------------------------
-    # ONLY RECENT EMAILS
-    # --------------------------------------------------------
-
     recent_uids = all_uids[
         -RECENT_EMAIL_LIMIT:
     ]
@@ -879,18 +894,10 @@ def check_mail():
         uid_text = uid.decode()
 
 
-        # ----------------------------------------------------
-        # OLD / ALREADY CHECKED UID
-        # ----------------------------------------------------
-
         if uid_text in processed_uids:
 
             continue
 
-
-        # ----------------------------------------------------
-        # FETCH EMAIL
-        # ----------------------------------------------------
 
         status, msg_data = mail.uid(
             "fetch",
@@ -916,10 +923,6 @@ def check_mail():
         )
 
 
-        # ----------------------------------------------------
-        # ONLY REPORT EMAILS
-        # ----------------------------------------------------
-
         if KEYWORD not in subject.upper():
 
             processed_uids.add(
@@ -933,6 +936,7 @@ def check_mail():
         print("=" * 70)
         print("NEW REPORT EMAIL DETECTED")
         print("=" * 70)
+
         print(
             f"Subject : {subject}"
         )
@@ -942,10 +946,6 @@ def check_mail():
 
         processed_successfully = False
 
-
-        # ----------------------------------------------------
-        # FIND PDF
-        # ----------------------------------------------------
 
         for part in msg.walk():
 
@@ -1017,7 +1017,7 @@ def check_mail():
                 )
 
                 print(
-                    f"Product Amt: {info['Product Amount']}"
+                    f"Product Amt: ₹{info['Product Amount']}"
                 )
 
                 print(
@@ -1025,33 +1025,18 @@ def check_mail():
                 )
 
                 print(
-                    f"Final Amt  : {info['Amount']}"
+                    f"FINAL AMT  : ₹{info['Amount']}"
                 )
 
-
-                # ------------------------------------------------
-                # INVOICE NUMBER VALIDATION
-                # ------------------------------------------------
 
                 if not invoice_no:
 
                     print(
-                        "WARNING: Invoice number could not "
-                        "be extracted."
-                    )
-
-                    print(
-                        "Email will NOT be sent to Telegram "
-                        "because duplicate protection requires "
-                        "an invoice number."
+                        "Invoice number not found."
                     )
 
                     break
 
-
-                # ------------------------------------------------
-                # DUPLICATE CHECK
-                # ------------------------------------------------
 
                 if invoice_no in processed_invoices:
 
@@ -1063,16 +1048,10 @@ def check_mail():
                         "Telegram alert SKIPPED."
                     )
 
-                    # This Gmail UID is now also considered
-                    # handled.
                     processed_successfully = True
 
                     break
 
-
-                # ------------------------------------------------
-                # SEND TELEGRAM
-                # ------------------------------------------------
 
                 process_invoice(
                     info
@@ -1083,10 +1062,6 @@ def check_mail():
                     "Telegram alert sent successfully."
                 )
 
-
-                # ------------------------------------------------
-                # REMEMBER INVOICE NUMBER
-                # ------------------------------------------------
 
                 processed_invoices.add(
                     invoice_no
@@ -1110,13 +1085,8 @@ def check_mail():
                 )
 
 
-            # Only process the first PDF
             break
 
-
-        # ----------------------------------------------------
-        # REMEMBER GMAIL UID
-        # ----------------------------------------------------
 
         if pdf_found and processed_successfully:
 
@@ -1124,27 +1094,16 @@ def check_mail():
                 uid_text
             )
 
-
         elif not pdf_found:
 
             print(
                 "REPORT email has no PDF."
             )
 
-            # Don't repeatedly inspect a bad REPORT email.
             processed_uids.add(
                 uid_text
             )
 
-
-        # If PDF exists but invoice extraction failed,
-        # UID is deliberately NOT marked processed.
-        # It can be retried next cycle.
-
-
-    # --------------------------------------------------------
-    # SAVE STATE
-    # --------------------------------------------------------
 
     state["processed_uids"] = list(
         processed_uids
@@ -1167,6 +1126,7 @@ def check_mail():
     if telegram_count:
 
         print()
+
         print(
             f"{telegram_count} NEW invoice alert(s) sent."
         )
@@ -1179,14 +1139,33 @@ def check_mail():
 if __name__ == "__main__":
 
     print()
+
     print("=" * 70)
+
     print("SVT INVOICE TELEGRAM AGENT")
+
     print("=" * 70)
-    print("Watching Gmail for NEW REPORT invoice emails")
-    print(f"Check interval : {CHECK_INTERVAL} seconds")
-    print("Duplicate key  : INVOICE NUMBER")
-    print("Mode           : UPDATE / NEW MAIL ONLY")
-    print("Weighment agent: UNTOUCHED")
+
+    print(
+        "Watching Gmail for NEW REPORT invoice emails"
+    )
+
+    print(
+        f"Check interval : {CHECK_INTERVAL} seconds"
+    )
+
+    print(
+        "Duplicate key  : INVOICE NUMBER"
+    )
+
+    print(
+        "Mode           : UPDATE / NEW MAIL ONLY"
+    )
+
+    print(
+        "Weighment agent: UNTOUCHED"
+    )
+
     print("=" * 70)
 
 
@@ -1199,6 +1178,7 @@ if __name__ == "__main__":
         except Exception as e:
 
             print()
+
             print(
                 f"Email check error: {e}"
             )
