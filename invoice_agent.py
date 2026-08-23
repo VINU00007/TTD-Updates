@@ -2,9 +2,11 @@ import imaplib
 import email
 from email.header import decode_header
 import os
+import requests
+import time
 import re
 from io import BytesIO
-
+from datetime import datetime, timedelta
 import pdfplumber
 
 
@@ -14,10 +16,49 @@ import pdfplumber
 
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 IMAP_SERVER = "imap.gmail.com"
 
+# Invoice emails have REPORT in the subject
 KEYWORD = "REPORT"
+
+CHECK_INTERVAL = 30
+
+
+# ============================================================
+# TIME
+# ============================================================
+
+def now_ist():
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(message: str):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    payload = {
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+
+    response = requests.post(
+        url,
+        data=payload,
+        timeout=20
+    )
+
+    response.raise_for_status()
 
 
 # ============================================================
@@ -46,9 +87,7 @@ def safe_decode(value):
 
         else:
 
-            output.append(
-                str(part)
-            )
+            output.append(str(part))
 
     return "".join(output)
 
@@ -148,7 +187,7 @@ def extract_invoice_from_pdf(pdf_bytes):
     vehicle = ""
 
     match = re.search(
-        r"Vehicle\s+Number\s*:\s*([A-Z0-9]+)",
+        r"Vehicle\s+Number\s*:\s*([A-Z0-9\-]+)",
         text,
         re.IGNORECASE
     )
@@ -184,7 +223,6 @@ def extract_invoice_from_pdf(pdf_bytes):
     quantity = ""
     rate = ""
     amount = ""
-
 
     match = re.search(
         r"\n1\s+"
@@ -280,44 +318,80 @@ def extract_invoice_from_pdf(pdf_bytes):
 
 
 # ============================================================
-# CHECK GMAIL
+# TELEGRAM INVOICE ALERT
+# ============================================================
+
+def process_invoice(info):
+
+    amount = info["Amount"]
+
+    if amount:
+
+        try:
+
+            amount_display = (
+                f"₹{float(amount):,.2f}"
+            )
+
+        except:
+
+            amount_display = f"₹{amount}"
+
+    else:
+
+        amount_display = "₹-"
+
+
+    message = (
+        "🧾  INVOICE ALERT  🧾\n\n"
+
+        f"📄 INVOICE NO : {info['Invoice No']}\n"
+        f"📅 DATE : {info['Invoice Date']}\n\n"
+
+        f"👤 {info['Party']}\n"
+        f"🚛 VEHICLE : {info['Vehicle']}\n"
+        f"🧾 RST : {info['RST']}\n\n"
+
+        f"🌾 PRODUCT : {info['Product']}\n"
+        f"📦 BAGS : {info['Bags']}\n"
+        f"⚖ QUANTITY : {info['Quantity']} Qntl\n\n"
+
+        f"💰 RATE : ₹{info['Rate']}\n"
+        f"💵 INVOICE AMOUNT : {amount_display}\n\n"
+
+        f"📍 PLACE : {info['Place']}\n\n"
+
+        "▣ INVOICE RECEIVED"
+    )
+
+    send_telegram(message)
+
+
+# ============================================================
+# EMAIL CHECK
 # ============================================================
 
 def check_mail():
 
-    print()
-    print("=" * 70)
-    print("CHECKING GMAIL FOR INVOICE REPORT")
-    print("=" * 70)
-
-
     mail = imaplib.IMAP4_SSL(
         IMAP_SERVER
     )
-
 
     mail.login(
         EMAIL_USER,
         EMAIL_PASS
     )
 
-
     mail.select(
         "inbox"
     )
-
 
     status, messages = mail.search(
         None,
         "(UNSEEN)"
     )
 
-
     if status != "OK":
-
-        print(
-            "Could not search mailbox."
-        )
 
         mail.logout()
 
@@ -326,102 +400,97 @@ def check_mail():
 
     mail_ids = messages[0].split()
 
-
     print(
-        f"Unread emails found: {len(mail_ids)}"
+        f"[{now_ist().strftime('%d-%m-%Y %I:%M:%S %p')}] "
+        f"Unread emails: {len(mail_ids)}"
     )
 
 
     for mail_id in mail_ids:
 
-        status, msg_data = mail.fetch(
-            mail_id,
-            "(RFC822)"
-        )
+        try:
 
-
-        if status != "OK":
-
-            continue
-
-
-        raw_email = msg_data[0][1]
-
-        msg = email.message_from_bytes(
-            raw_email
-        )
-
-
-        subject = safe_decode(
-            msg.get("Subject")
-        )
-
-
-        sender = safe_decode(
-            msg.get("From")
-        )
-
-
-        print()
-        print(
-            f"Email: {subject}"
-        )
-
-
-        # ----------------------------------------------------
-        # SUBJECT CHECK
-        # ----------------------------------------------------
-
-        if KEYWORD not in subject.upper():
-
-            print(
-                "Not an invoice REPORT email."
+            status, msg_data = mail.fetch(
+                mail_id,
+                "(RFC822)"
             )
 
-            # IMPORTANT:
-            # Do NOT mark it Seen.
-            continue
+            if status != "OK":
+
+                continue
 
 
-        print(
-            "REPORT subject detected."
-        )
+            raw_email = msg_data[0][1]
+
+            msg = email.message_from_bytes(
+                raw_email
+            )
 
 
-        pdf_found = False
+            subject = safe_decode(
+                msg.get("Subject")
+            )
 
 
-        # ----------------------------------------------------
-        # ATTACHMENT CHECK
-        # ----------------------------------------------------
-
-        for part in msg.walk():
-
-            filename = part.get_filename()
-
-            content_type = part.get_content_type()
+            print(
+                f"Checking: {subject}"
+            )
 
 
-            if (
+            # ------------------------------------------------
+            # ONLY REPORT EMAILS
+            # ------------------------------------------------
 
-                (
-                    filename
-                    and
-                    filename.lower().endswith(".pdf")
-                )
+            if KEYWORD not in subject.upper():
 
-                or
+                # IMPORTANT:
+                # Leave unrelated emails untouched.
+                continue
 
-                content_type == "application/pdf"
 
-            ):
+            print(
+                "REPORT invoice email detected."
+            )
+
+
+            pdf_found = False
+
+            processed_successfully = False
+
+
+            # ------------------------------------------------
+            # FIND PDF
+            # ------------------------------------------------
+
+            for part in msg.walk():
+
+                filename = part.get_filename()
+
+                content_type = part.get_content_type()
+
+
+                if not (
+
+                    (
+                        filename
+                        and
+                        filename.lower().endswith(".pdf")
+                    )
+
+                    or
+
+                    content_type == "application/pdf"
+
+                ):
+
+                    continue
+
 
                 pdf_found = True
 
 
-                print()
                 print(
-                    f"PDF FOUND: {filename}"
+                    f"Invoice PDF found: {filename}"
                 )
 
 
@@ -433,7 +502,7 @@ def check_mail():
                 if not pdf_data:
 
                     print(
-                        "PDF attachment has no data."
+                        "PDF attachment is empty."
                     )
 
                     continue
@@ -443,119 +512,112 @@ def check_mail():
                 # EXTRACT
                 # ------------------------------------------------
 
-                try:
+                info = extract_invoice_from_pdf(
+                    pdf_data
+                )
 
-                    info = extract_invoice_from_pdf(
-                        pdf_data
-                    )
 
-                except Exception as e:
+                print(
+                    f"Invoice No: {info['Invoice No']}"
+                )
 
-                    print(
-                        f"PDF extraction error: {e}"
-                    )
+                print(
+                    f"Party: {info['Party']}"
+                )
 
-                    continue
+                print(
+                    f"Amount: {info['Amount']}"
+                )
 
 
                 # ------------------------------------------------
-                # DISPLAY
+                # SEND TELEGRAM
                 # ------------------------------------------------
 
-                print()
-                print(
-                    "=" * 70
-                )
-
-                print(
-                    "INVOICE DETECTED"
-                )
-
-                print(
-                    "=" * 70
-                )
-
-                print(
-                    f"Invoice No : {info['Invoice No']}"
-                )
-
-                print(
-                    f"Date       : {info['Invoice Date']}"
-                )
-
-                print(
-                    f"Party      : {info['Party']}"
-                )
-
-                print(
-                    f"Vehicle    : {info['Vehicle']}"
-                )
-
-                print(
-                    f"RST        : {info['RST']}"
-                )
-
-                print(
-                    f"Product    : {info['Product']}"
-                )
-
-                print(
-                    f"Bags       : {info['Bags']}"
-                )
-
-                print(
-                    f"Quantity   : {info['Quantity']} Qntl"
-                )
-
-                print(
-                    f"Rate       : ₹{info['Rate']}"
-                )
-
-                print(
-                    f"Amount     : ₹{info['Amount']}"
-                )
-
-                print(
-                    f"Place      : {info['Place']}"
-                )
-
-                print(
-                    "=" * 70
+                process_invoice(
+                    info
                 )
 
 
-        if not pdf_found:
+                print(
+                    "Telegram invoice alert sent."
+                )
+
+
+                processed_successfully = True
+
+
+                # Only process the first PDF
+                break
+
+
+            # ------------------------------------------------
+            # MARK ONLY SUCCESSFULLY PROCESSED INVOICE EMAIL
+            # ------------------------------------------------
+
+            if pdf_found and processed_successfully:
+
+                mail.store(
+                    mail_id,
+                    "+FLAGS",
+                    "\\Seen"
+                )
+
+                print(
+                    "Invoice email marked as Seen."
+                )
+
+            elif not pdf_found:
+
+                print(
+                    "REPORT email found but no PDF. "
+                    "Email left unread."
+                )
+
+
+        except Exception as e:
 
             print(
-                "REPORT email found, but NO PDF attachment."
+                f"Invoice processing error: {e}"
             )
+
+            # IMPORTANT:
+            # Failed invoice remains unread so it can
+            # be retried on the next cycle.
 
 
     mail.logout()
 
 
 # ============================================================
-# MAIN
+# MAIN CONTINUOUS LOOP
 # ============================================================
 
 if __name__ == "__main__":
 
-    if not EMAIL_USER:
+    print()
+    print("=" * 70)
+    print("SVT INVOICE TELEGRAM AGENT")
+    print("=" * 70)
+    print("Watching Gmail for REPORT invoice emails")
+    print(f"Check interval : {CHECK_INTERVAL} seconds")
+    print("Weighment agent : UNTOUCHED")
+    print("=" * 70)
 
-        print(
-            "ERROR: EMAIL_USER is not set."
+
+    while True:
+
+        try:
+
+            check_mail()
+
+        except Exception as e:
+
+            print(
+                f"Email check error: {e}"
+            )
+
+
+        time.sleep(
+            CHECK_INTERVAL
         )
-
-        raise SystemExit(1)
-
-
-    if not EMAIL_PASS:
-
-        print(
-            "ERROR: EMAIL_PASS is not set."
-        )
-
-        raise SystemExit(1)
-
-
-    check_mail()
